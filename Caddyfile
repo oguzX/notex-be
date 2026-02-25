@@ -1,0 +1,10 @@
+:8000 {
+  @mcp path /mcp* /mcp/*
+  handle @mcp {
+    reverse_proxy mcp_http:8001
+  }
+
+  handle {
+    reverse_proxy api:8000
+  }
+}

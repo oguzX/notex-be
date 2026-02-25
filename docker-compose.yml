@@ -1,0 +1,122 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: notex
+      POSTGRES_PASSWORD: notex
+      POSTGRES_DB: notex
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notex"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      target: development
+    environment:
+      - ENV=development
+      - DATABASE_URL=postgresql+asyncpg://notex:notex@db:5432/notex
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - MCP_SERVER_URL=https://griffinesque-leonel-hubbly.ngrok-free.dev/mcp
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=console
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+  worker:
+    build:
+      context: .
+      target: development
+    environment:
+      - ENV=development
+      - DATABASE_URL=postgresql+asyncpg://notex:notex@db:5432/notex
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=console
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["celery", "-A", "app.workers.celery_app", "worker", "--loglevel=info"]
+  mcp:
+    build:
+      context: .
+      target: development
+    environment:
+      - ENV=development
+      - REDIS_URL=redis://redis:6379/5
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=console
+    volumes:
+      - .:/app
+    stdin_open: true
+    tty: true
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["python", "-m", "app.mcp_server.server"]
+
+  mcp_http:
+    build:
+      context: .
+      target: development
+    environment:
+      - ENV=development
+      - REDIS_URL=redis://redis:6379/5
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=console
+    volumes:
+      - .:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["uvicorn", "app.mcp_server.http_bridge:app", "--host", "0.0.0.0", "--port", "8001", "--reload", "--timeout-keep-alive", "120"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - api
+      - mcp_http
+
+
+volumes:
+  postgres_data:

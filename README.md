@@ -4,24 +4,28 @@ A production-ready FastAPI backend for a conversational task management system w
 
 ## Features
 
-- 💬 **Chat-driven interface**: Natural language task management
-- 🤖 **LLM Integration**: OpenAI GPT and Google Gemini support
-- ⚡ **Realtime Updates**: WebSocket and SSE for live event streaming
-- 🔄 **Latest-wins semantics**: Automatic stale proposal detection
-- 🎯 **Smart Resolution**: Natural language reference matching
-- 📝 **Audit Trail**: Complete task event history
-- 🐳 **Dockerized**: Full development environment
-- ✅ **Production Ready**: Type hints, logging, error handling, tests
+- **Chat-driven interface**: Natural language task management
+- **LLM Integration**: OpenAI GPT and Google Gemini support
+- **MCP Tool Mode**: Extensible tool calling via Model Context Protocol (weather, FX, and more)
+- **Realtime Updates**: WebSocket and SSE for live event streaming
+- **Latest-wins semantics**: Automatic stale proposal detection
+- **Smart Resolution**: Natural language reference matching
+- **Conflict Detection**: Scheduling conflict detection with resolution options
+- **Audit Trail**: Complete task event history
+- **Dockerized**: Full development environment
+- **Production Ready**: Type hints, logging, error handling, tests
 
 ## Architecture
 
 ### Tech Stack
 
-- **API**: FastAPI (async) with Python 3.12
+- **API**: FastAPI (async) with Python 3.12+
 - **Database**: PostgreSQL 16 with SQLAlchemy 2.0 (async)
 - **Cache/Queue**: Redis 7
 - **Background Jobs**: Celery
 - **Realtime**: WebSocket + SSE via Redis PubSub
+- **LLM**: OpenAI Responses API or Google Gemini
+- **MCP**: fastmcp for tool extension
 - **Migrations**: Alembic
 - **Code Quality**: Ruff, MyPy, pre-commit
 
@@ -33,14 +37,15 @@ User Message → API → DB + Version Increment → Celery Task
               Events (Redis PubSub + Streams)
                 ↓
            WebSocket Broadcast
-                
+
 Celery Worker:
   1. Load context (messages + tasks)
-  2. Call LLM → Generate proposal
-  3. Resolve natural references
-  4. Check staleness
-  5. Auto-apply or wait for confirmation
-  6. Publish events
+  2. Classify intent (ops vs tool mode)
+  3. Call LLM → Generate proposal or tool response
+  4. Resolve natural references
+  5. Check staleness + scheduling conflicts
+  6. Auto-apply or wait for confirmation
+  7. Publish events
 ```
 
 ### Data Models
@@ -51,6 +56,40 @@ Celery Worker:
 - **Tasks**: To-do items with metadata
 - **TaskEvents**: Immutable audit log
 - **TaskAliases**: Natural language references
+
+## Quick Start
+
+### 1. Clone and setup
+
+```bash
+git clone <repo-url> && cd notex
+cp .env.example .env
+# Edit .env with your API keys
+```
+
+### 2. Start services
+
+```bash
+docker compose up --build
+```
+
+This starts:
+- **API** on `http://localhost:8000`
+- **MCP HTTP bridge** on `http://localhost:8001`
+- **PostgreSQL** on `localhost:5432`
+- **Redis** on `localhost:6379`
+- **Celery Worker** for background processing
+
+### 3. Run migrations
+
+```bash
+docker compose exec api alembic upgrade head
+```
+
+### 4. Open API docs
+
+- Swagger UI: http://localhost:8000/v1/docs
+- Health check: http://localhost:8000/healthz
 
 ## API Endpoints
 
@@ -77,28 +116,17 @@ curl -X POST http://localhost:8000/register/guest \
 }
 ```
 
-**Example: Use Access Token**
-```bash
-curl -X POST http://localhost:8000/v1/conversations \
-  -H "Authorization: Bearer eyJhbGc..."
-```
-
-**Example: Refresh Token**
-```bash
-curl -X POST http://localhost:8000/auth/refresh \
-  -H "Content-Type: application/json" \
-  -d '{"refresh_token": "abc123..."}'
-```
+**All `/v1/*` endpoints require `Authorization: Bearer <access_token>`.**
 
 ### Conversations
 
-- `POST /v1/conversations` - Create conversation (requires auth)
-- `GET /v1/conversations/{id}` - Get conversation (requires auth, ownership checked)
+- `POST /v1/conversations` - Create conversation
+- `GET /v1/conversations/{id}` - Get conversation
 
 ### Messages
 
-- `POST /v1/conversations/{id}/messages` - Send message (requires auth, ownership checked)
-- `GET /v1/conversations/{id}/messages` - List messages (requires auth, ownership checked)
+- `POST /v1/conversations/{id}/messages` - Send message
+- `GET /v1/conversations/{id}/messages` - List messages
 
 **Send Message Request Body:**
 ```json
@@ -111,17 +139,12 @@ curl -X POST http://localhost:8000/auth/refresh \
 
 #### Idempotency
 
-The Messages API supports optional idempotency via `client_message_id`. If you provide this field:
+Supply `client_message_id` to prevent duplicate task creation from retries:
 
-- If a message with the same `(conversation_id, client_message_id)` already exists, the API returns the existing message without creating a duplicate or re-enqueuing processing.
-- This prevents duplicate task creation from accidental retries (network issues, double-taps).
-
-**Example with idempotency key:**
 ```bash
 curl -X POST http://localhost:8000/v1/conversations/{id}/messages \
   -H "Authorization: Bearer eyJhbGc..." \
   -H "Content-Type: application/json" \
-  -H "X-Request-ID: req-123" \
   -d '{
     "content": "Schedule a call at 3pm",
     "client_message_id": "msg-abc-123-unique",
@@ -129,368 +152,145 @@ curl -X POST http://localhost:8000/v1/conversations/{id}/messages \
   }'
 ```
 
-If the request is retried with the same `client_message_id`, the response will return `"enqueued": false` indicating no new processing was triggered.
+If retried with the same `client_message_id`, the response returns `"enqueued": false`.
 
 ### Tasks
 
-- `GET /v1/tasks` - List all tasks for current user across all conversations (requires auth)
-- `GET /v1/conversations/{id}/tasks` - List tasks for a conversation (requires auth, ownership checked)
+- `GET /v1/tasks` - List all tasks for current user
+- `GET /v1/conversations/{id}/tasks` - List tasks for a conversation
 
-**List All Tasks Query Parameters:**
-- `date_from` (optional): Filter tasks with due_at >= this date (YYYY-MM-DD)
-- `date_to` (optional): Filter tasks with due_at < day after this date (YYYY-MM-DD)
-- `status` (optional): Filter by status: `all` (default), `active`, `cancelled`
-
-**Example: List All User Tasks**
-```bash
-curl -X GET "http://localhost:8000/v1/tasks?date_from=2026-01-01&date_to=2026-01-31&status=active" \
-  -H "Authorization: Bearer eyJhbGc..."
-```
+**Query Parameters:**
+- `date_from` (optional): Filter tasks with `due_at >= YYYY-MM-DD`
+- `date_to` (optional): Filter tasks with `due_at < day after YYYY-MM-DD`
+- `status` (optional): `all` (default), `active`, `cancelled`
 
 ### Proposals
 
-- `GET /v1/proposals/{id}` - Get proposal (requires auth, ownership checked)
-- `GET /v1/conversations/{id}/proposals` - List proposals (requires auth, ownership checked)
-- `POST /v1/proposals/apply` - Manually apply proposal (requires auth, ownership checked)
-- `POST /v1/proposals/{id}/confirm-time` - Confirm time for proposal requiring time clarification
+- `GET /v1/proposals/{id}` - Get proposal
+- `GET /v1/conversations/{id}/proposals` - List proposals
+- `POST /v1/proposals/{id}/confirm` - Confirm proposal (time or conflict resolution)
+- `POST /v1/proposals/apply` - Manually apply proposal
 
 ### Realtime
 
 - `WS /v1/ws/conversations/{id}` - WebSocket connection
 - `GET /v1/conversations/{id}/events` - SSE stream (alternative)
 
-**Note**: All `/v1/*` endpoints require authentication via `Authorization: Bearer <access_token>` header.
-Accessing resources belonging to other users returns `403 Forbidden`.
+## Confirmation Flows
 
-## Time Confirmation Flow
+### Time Confirmation
 
-When `auto_apply=false` and a user message implies creating a task without specifying a time, the system:
+When `auto_apply=false` and no time is specified, the system returns `needs_confirmation` with suggested times:
 
-1. Returns the proposal with status `needs_confirmation`
-2. Includes `clarifications` with suggested times
-3. Requires confirmation via `POST /v1/proposals/{id}/confirm-time` before applying
-
-**Example: Send Message with auto_apply=false**
-```bash
-curl -X POST http://localhost:8000/v1/conversations/{id}/messages \
-  -H "Authorization: Bearer eyJhbGc..." \
-  -H "Content-Type: application/json" \
-  -d '{
-    "content": "Add a meeting tomorrow",
-    "auto_apply": false,
-    "timezone": "Europe/Istanbul"
-  }'
-```
-
-**Response with needs_confirmation:**
 ```json
 {
-  "id": "msg-123",
-  "proposal_id": "prop-456",
   "status": "needs_confirmation",
-  "ops": {
-    "ops": [{
-      "op": "create",
-      "temp_id": "task_1",
-      "title": "Meeting tomorrow",
-      "due_at": null
-    }],
-    "needs_confirmation": true,
-    "clarifications": [{
-      "field": "due_at",
-      "op_ref": {"type": "temp_id", "value": "task_1"},
-      "message": "When would you like to schedule 'Meeting tomorrow'?",
-      "suggestions": [{
-        "due_at": "2026-01-30T19:00:00+03:00",
-        "timezone": "Europe/Istanbul",
-        "label": "Tomorrow evening at 7 PM (suggested)",
-        "confidence": 0.7
-      }]
-    }]
-  }
+  "clarifications": [{
+    "clarification_id": "clr_18d5f0c_abc123",
+    "field": "due_at",
+    "message": "When would you like to schedule 'Meeting tomorrow'?",
+    "suggestions": [...]
+  }]
 }
 ```
 
-**Confirm Time:**
+Confirm with:
 ```bash
-curl -X POST http://localhost:8000/v1/proposals/prop-456/confirm-time \
+curl -X POST http://localhost:8000/v1/proposals/{id}/confirm \
   -H "Authorization: Bearer eyJhbGc..." \
-  -H "Content-Type: application/json" \
   -d '{
-    "updates": [{
-      "ref": {"type": "temp_id", "value": "task_1"},
-      "due_at": "2026-01-30T20:00:00+03:00",
-      "timezone": "Europe/Istanbul"
-    }]
+    "updates": [{"clarification_id": "clr_18d5f0c_abc123", "due_at": "2026-01-30T20:00:00+03:00", "timezone": "Europe/Istanbul"}],
+    "action": "apply"
   }'
 ```
 
-**Response:**
+### Conflict Resolution
+
+When a new task conflicts with an existing one (within ±30 min), the system returns conflict info:
+
 ```json
 {
-  "proposal_id": "prop-456",
-  "applied": true,
-  "tasks_affected": 1
-}
-```
-
-## Conflict-Aware Confirmation Flow
-
-The system detects scheduling conflicts when creating tasks at times that overlap with existing tasks (within ±30 minutes).
-
-### Scenario Example
-
-1. User creates a task: "meet my mom at 7 PM" → Task created at 19:00
-2. Later, user says: "we will meet friends at 7 PM" (same time)
-3. System detects conflict and asks user to choose:
-   - **Replace existing**: Cancel old task, create new task at the requested time
-   - **Reschedule new**: Choose a different time for the new task
-   - **Cancel new**: Cancel the new task entirely
-
-### New Confirm Endpoint
-
-`POST /v1/proposals/{proposal_id}/confirm`
-
-This is the primary endpoint for confirming proposals with time updates or conflict resolution.
-
-**Request Body:**
-```json
-{
-  "updates": [
-    {
-      "clarification_id": "clr_123abc...",
-      "due_at": "2026-01-29T20:00:00Z",
-      "timezone": "UTC"
-    }
-  ],
-  "action": "apply" | "replace_existing" | "reschedule_new" | "cancel_new"
+  "status": "needs_confirmation",
+  "clarifications": [{
+    "field": "conflict",
+    "message": "You already have 'Meet mom' at 07:00 PM. Do you want to cancel it?",
+    "available_actions": ["replace_existing", "reschedule_new", "cancel_new"]
+  }]
 }
 ```
 
 **Actions:**
-- `apply`: Apply proposal if no conflicts (or fill in due_at for missing times)
-- `replace_existing`: Cancel the conflicting existing task and create the new one
-- `reschedule_new`: Update the new task's time and re-check for conflicts
-- `cancel_new`: Cancel the proposal entirely (no new task created)
+- `replace_existing` — Cancel conflicting task, create new one
+- `reschedule_new` — Set a new time for the proposed task
+- `cancel_new` — Cancel the proposal entirely
 
-### Example: Conflict Detected
+## MCP Tool Integration
 
-When a proposal has a scheduling conflict, the response includes:
+The system supports tool mode via Model Context Protocol for non-task queries (weather, currency conversion, etc.).
 
-```json
-{
-  "id": "prop-789",
-  "status": "needs_confirmation",
-  "ops": {
-    "ops": [{
-      "op": "create",
-      "temp_id": "task_1",
-      "title": "Meet friends",
-      "due_at": "2026-01-29T19:00:00Z"
-    }],
-    "needs_confirmation": true,
-    "clarifications": [{
-      "clarification_id": "clr_18d5f0c_abc123",
-      "field": "conflict",
-      "target_temp_id": "task_1",
-      "message": "You already have 'Meet mom' at 07:00 PM. Do you want to cancel it and schedule 'Meet friends'?",
-      "suggestions": [
-        {
-          "due_at": "2026-01-29T20:00:00Z",
-          "timezone": "UTC",
-          "label": "08:00 PM (1 hour later)",
-          "confidence": 0.7
-        },
-        {
-          "due_at": "2026-01-29T20:30:00Z",
-          "timezone": "UTC",
-          "label": "08:30 PM (1.5 hours later)",
-          "confidence": 0.7
-        }
-      ],
-      "context": {
-        "upcoming_tasks": [
-          {
-            "task_id": "existing-task-uuid",
-            "conversation_id": "conv-uuid",
-            "title": "Meet mom",
-            "due_at": "2026-01-29T19:00:00Z",
-            "status": "active"
-          }
-        ],
-        "window_start": "2026-01-29T16:00:00Z",
-        "window_end": "2026-01-29T22:00:00Z"
-      },
-      "conflict": {
-        "existing_task": {
-          "task_id": "existing-task-uuid",
-          "conversation_id": "conv-uuid",
-          "title": "Meet mom",
-          "due_at": "2026-01-29T19:00:00Z",
-          "status": "active"
-        },
-        "proposed_due_at": "2026-01-29T19:00:00Z",
-        "window_minutes": 30
-      },
-      "available_actions": ["replace_existing", "reschedule_new", "cancel_new"]
-    }]
-  }
-}
-```
+Intent is classified automatically:
+- "What's the weather in Paris?" → **Tool mode**
+- "Create a task for tomorrow" → **Ops mode**
 
-### Example: Replace Existing Task
-
-```bash
-curl -X POST http://localhost:8000/v1/proposals/prop-789/confirm \
-  -H "Authorization: Bearer eyJhbGc..." \
-  -H "Content-Type: application/json" \
-  -d '{
-    "updates": [],
-    "action": "replace_existing"
-  }'
-```
-
-**Response:**
-```json
-{
-  "proposal_id": "prop-789",
-  "status": "applied",
-  "applied": true,
-  "tasks_affected": 1,
-  "tasks_canceled": 1,
-  "needs_further_confirmation": false
-}
-```
-
-### Example: Reschedule to Alternative Time
-
-```bash
-curl -X POST http://localhost:8000/v1/proposals/prop-789/confirm \
-  -H "Authorization: Bearer eyJhbGc..." \
-  -H "Content-Type: application/json" \
-  -d '{
-    "updates": [{
-      "clarification_id": "clr_18d5f0c_abc123",
-      "due_at": "2026-01-29T20:00:00Z",
-      "timezone": "UTC"
-    }],
-    "action": "reschedule_new"
-  }'
-```
-
-**Response (if new time is conflict-free):**
-```json
-{
-  "proposal_id": "prop-789",
-  "status": "applied",
-  "applied": true,
-  "tasks_affected": 1,
-  "tasks_canceled": 0,
-  "needs_further_confirmation": false
-}
-```
-
-**Response (if new time also has conflicts):**
-```json
-{
-  "proposal_id": "prop-789",
-  "status": "needs_confirmation",
-  "applied": false,
-  "tasks_affected": 0,
-  "needs_further_confirmation": true,
-  "clarifications": [
-    {
-      "clarification_id": "clr_18d5f0d_def456",
-      "field": "conflict",
-      "message": "'Meet friends' at 08:00 PM conflicts with 'Another task'",
-      "available_actions": ["replace_existing", "reschedule_new", "cancel_new"]
-    }
-  ]
-}
-```
-
-### Example: Cancel New Task
-
-```bash
-curl -X POST http://localhost:8000/v1/proposals/prop-789/confirm \
-  -H "Authorization: Bearer eyJhbGc..." \
-  -H "Content-Type: application/json" \
-  -d '{
-    "updates": [],
-    "action": "cancel_new"
-  }'
-```
-
-**Response:**
-```json
-{
-  "proposal_id": "prop-789",
-  "status": "canceled",
-  "applied": false,
-  "tasks_affected": 0,
-  "tasks_canceled": 0,
-  "needs_further_confirmation": false
-}
-```
-
-### Clarification Reference by ID
-
-The new confirm endpoint uses `clarification_id` to reference specific clarifications, simplifying the API:
-
-**Old approach (deprecated):**
-```json
-{
-  "updates": [{
-    "ref": {"type": "temp_id", "value": "task_1"},
-    "due_at": "..."
-  }]
-}
-```
-
-**New approach:**
-```json
-{
-  "updates": [{
-    "clarification_id": "clr_18d5f0c_abc123",
-    "due_at": "..."
-  }]
-}
-```
-
-The server generates a stable `clarification_id` for each clarification, which is returned in the proposal response and used to reference it in the confirm request.
+See [MCP_QUICKSTART.md](MCP_QUICKSTART.md) for setup and available tools.
 
 ## Event Types
 
-- `message.received` - User message stored
-- `llm.queued` - Processing job enqueued
-- `llm.running` - LLM generating proposal
-- `proposal.ready` - Proposal ready to apply
-- `proposal.needs_confirmation` - Missing time or conflict detected
-- `proposal.applied` - Operations executed
-- `proposal.stale` - Newer version exists
-- `proposal.failed` - Processing error
-- `proposal.canceled` - User canceled the proposal
-- `tasks.changed` - Tasks modified
+| Event | Description |
+|-------|-------------|
+| `message.received` | User message stored |
+| `llm.queued` | Processing job enqueued |
+| `llm.running` | LLM generating proposal |
+| `proposal.ready` | Proposal ready to apply |
+| `proposal.needs_confirmation` | Missing time or conflict detected |
+| `proposal.applied` | Operations executed |
+| `proposal.stale` | Newer version exists |
+| `proposal.failed` | Processing error |
+| `proposal.canceled` | User canceled the proposal |
+| `tasks.changed` | Tasks modified |
 
 ## Environment Variables
 
-See [.env.example](.env.example) for all options.
+Copy `.env.example` to `.env` and fill in values.
 
-**Required**:
-- `DATABASE_URL`: PostgreSQL connection
-- `REDIS_URL`: Redis connection
-- `CELERY_BROKER_URL`: Celery broker
-- `CELERY_RESULT_BACKEND`: Celery results
+**Required:**
+| Variable | Description |
+|----------|-------------|
+| `DATABASE_URL` | PostgreSQL connection string |
+| `REDIS_URL` | Redis connection string |
+| `CELERY_BROKER_URL` | Celery broker (Redis) |
+| `CELERY_RESULT_BACKEND` | Celery result backend (Redis) |
 
-**Optional**:
-- `LLM_PROVIDER`: `openai` or `gemini` (default: openai)
-- `OPENAI_API_KEY`: OpenAI API key (mock mode if not set)
-- `GEMINI_API_KEY`: Gemini API key (mock mode if not set)
-- `JWT_SECRET`: Secret key for JWT signing (default: insecure, change in production)
-- `ACCESS_TOKEN_TTL_SECONDS`: Access token lifetime (default: 900 = 15 minutes)
-- `REFRESH_TOKEN_TTL_SECONDS`: Refresh token lifetime (default: 2592000 = 30 days)
-- `LOG_LEVEL`: Logging level
-- `RESOLVER_CONFIDENCE_THRESHOLD`: Min score for auto-resolution (default: 0.65)
+**LLM:**
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLM_PROVIDER` | `openai` | `openai` or `gemini` |
+| `OPENAI_API_KEY` | — | OpenAI API key |
+| `GEMINI_API_KEY` | — | Gemini API key |
+| `OPENAI_MODEL` | `gpt-4o` | OpenAI model |
+| `GEMINI_MODEL` | `gemini-2.0-flash-exp` | Gemini model |
+
+**Auth:**
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `JWT_SECRET` | insecure default | Secret key — **change in production** |
+| `ACCESS_TOKEN_TTL_SECONDS` | `900` | 15 minutes |
+| `REFRESH_TOKEN_TTL_SECONDS` | `2592000` | 30 days |
+
+**MCP:**
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_ENABLED` | `true` | Enable MCP tool mode |
+| `MCP_SERVER_URL` | `http://mcp_http:8001/sse` | MCP server endpoint |
+
+**Other:**
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOG_LEVEL` | `INFO` | Logging level |
+| `RESOLVER_CONFIDENCE_THRESHOLD` | `0.65` | Min score for auto-resolution |
+| `NOTIFICATIONS_ENABLED` | `true` | Enable push notifications |
+| `ONESIGNAL_APP_ID` | — | OneSignal app ID |
+| `ONESIGNAL_REST_API_KEY` | — | OneSignal REST API key |
 
 ## Development
 
@@ -500,7 +300,7 @@ See [.env.example](.env.example) for all options.
 # Install dependencies
 pip install -e ".[dev]"
 
-# Setup pre-commit
+# Setup pre-commit hooks
 pre-commit install
 
 # Copy env file
@@ -513,36 +313,35 @@ docker compose up -d
 docker compose exec api alembic upgrade head
 ```
 
-### Running Services
+### Makefile Commands
 
 ```bash
-# All services
-make up
+make up           # Start all services
+make down         # Stop all services
+make logs         # Follow logs
+make test         # Run tests
+make format       # Format code (ruff)
+make lint         # Lint code
+make type-check   # MyPy type check
+make alembic-upgrade  # Run migrations
+```
 
-# View logs
-make logs
+### Running Locally (without Docker)
 
-# API only (with auto-reload)
+```bash
+# API
 uvicorn app.main:app --reload
 
-# Worker only
+# Worker
 celery -A app.workers.celery_app worker --loglevel=info
 ```
 
 ### Code Quality
 
 ```bash
-# Format code
-make format
-
-# Lint
-make lint
-
-# Type check
-make type-check
-
-# Run tests
-make test
+make format       # ruff format + fix
+make lint         # ruff check
+make type-check   # mypy
 ```
 
 ## Project Structure
@@ -553,14 +352,15 @@ app/
 ├── db/            # Models, repositories, session
 ├── schemas/       # Pydantic models
 ├── services/      # Business logic
-├── llm/           # LLM provider implementations
+├── llm/           # LLM providers, router, intent classifier
+├── mcp_server/    # MCP server + HTTP bridge
 ├── events/        # Event bus, PubSub, Streams, WebSocket
 ├── workers/       # Celery tasks
 ├── routes/        # API endpoints
+├── auth/          # JWT authentication
+├── notifications/ # Push notification integration
 └── utils/         # Helpers (time, similarity, IDs)
 ```
-
-See [FILE_SUMMARY.md](FILE_SUMMARY.md) for detailed module descriptions.
 
 ## Testing
 
@@ -568,34 +368,30 @@ See [FILE_SUMMARY.md](FILE_SUMMARY.md) for detailed module descriptions.
 # Run all tests
 pytest
 
-# With coverage
+# With coverage report
 pytest --cov=app --cov-report=html
 
-# Specific test
+# Specific test file
 pytest tests/test_resolver.py -v
 ```
 
 ## Deployment
 
-### Docker Compose (Production)
+### Docker Compose
 
 ```bash
-docker compose -f docker-compose.yml up -d
+docker compose up -d
 ```
 
-### Environment
+### Production Checklist
 
-Set `ENV=production` and configure:
-- Secure database credentials
-- Production Redis instance
-- API keys for LLM providers
-- `LOG_FORMAT=json`
-
-## Troubleshooting
-
-See [DEBUGGING_CHECKLIST.md](DEBUGGING_CHECKLIST.md)
+- Set `ENV=production`
+- Set a strong `JWT_SECRET`
+- Configure production database credentials
+- Set `LOG_FORMAT=json`
+- Configure LLM API keys
+- Set up push notifications (OneSignal) if needed
 
 ## License
 
 MIT
-# notex-be
